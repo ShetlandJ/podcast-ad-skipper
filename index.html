@@ -91,6 +91,7 @@
           <option value="both">both</option>
         </select>
       </label>
+      <button id="downloadClean" disabled title="Save a copy of the MP3 with the ad segments cut out (no re-encoding)">Download without ads</button>
     </div>
     <audio id="audio" controls preload="metadata"></audio>
     <canvas id="timeline"></canvas>
@@ -775,6 +776,7 @@ function recombine() {
   $('hitCount').textContent = S.transcript.length ? `${S.hits.length} hits` : '';
   renderSegments(); renderTranscript(); drawAll();
   $('exportJson').disabled = !S.segments.length;
+  $('downloadClean').disabled = !S.segments.length;
   const G = S.G;
   const cpCount = (type) => G.changePoints.filter((c) => c.types.has(type)).length;
   $('sigSummary').textContent = `Speech level ${G.speech.toFixed(1)} dBFS, silence below ${G.silThr.toFixed(1)} dBFS. ` +
@@ -888,6 +890,67 @@ async function runCompare(fileB) {
     $('cmpStatus').textContent = 'Comparison failed: ' + err.message;
   }
 }
+
+// ---------- export without ads ----------
+// Copies the original MP3 frames for everything outside the ad segments, so
+// there's no re-encoding and cuts land on frame boundaries (~26 ms).
+function id3WithoutLength(bytes) {
+  if (!(bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33)) return new Uint8Array(0);
+  const ver = bytes[3], flags = bytes[5];
+  const syncsafe = (p) => ((bytes[p] & 0x7f) << 21) | ((bytes[p + 1] & 0x7f) << 14) | ((bytes[p + 2] & 0x7f) << 7) | (bytes[p + 3] & 0x7f);
+  const size = syncsafe(6), end = 10 + size;
+  // unusual layouts: keep the tag as-is rather than risk corrupting it
+  if ((ver !== 3 && ver !== 4) || (flags & 0xc0)) return bytes.slice(0, end + ((flags & 0x10) ? 10 : 0));
+  const keep = [];
+  let pos = 10;
+  while (pos + 10 <= end && bytes[pos] !== 0) {
+    const id = String.fromCharCode(bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]);
+    const fsize = ver === 4 ? syncsafe(pos + 4) : ((bytes[pos + 4] << 24) | (bytes[pos + 5] << 16) | (bytes[pos + 6] << 8) | bytes[pos + 7]) >>> 0;
+    if (pos + 10 + fsize > end) break;
+    if (id !== 'TLEN') keep.push(bytes.subarray(pos, pos + 10 + fsize)); // TLEN would report the old duration
+    pos += 10 + fsize;
+  }
+  const body = keep.reduce((n, f) => n + f.length, 0), out = new Uint8Array(10 + body);
+  out.set(bytes.subarray(0, 10)); out[5] = flags & ~0x10;
+  out[6] = (body >> 21) & 0x7f; out[7] = (body >> 14) & 0x7f; out[8] = (body >> 7) & 0x7f; out[9] = body & 0x7f;
+  let o = 10; for (const f of keep) { out.set(f, o); o += f.length; }
+  return out;
+}
+
+async function downloadWithoutAds() {
+  const ads = adSegments();
+  if (!S.file) return;
+  if (!ads.length) { alertMsg('No ad segments to remove.'); return; }
+  const btn = $('downloadClean'); btn.disabled = true;
+  try {
+    const bytes = new Uint8Array(await S.file.arrayBuffer());
+    const fr = parseMp3Frames(bytes);
+    if (!fr) { alertMsg('Export without ads only works for MP3 files.'); return; }
+    const { offsets, rate, spf, end } = fr, n = offsets.length;
+    const frameAt = (t) => Math.max(0, Math.min(n, Math.round((t * rate) / spf)));
+    // frame ranges to keep
+    const keep = []; let f = 0;
+    for (const s of ads) {
+      const a = frameAt(s.start), b = frameAt(s.end);
+      if (a > f) keep.push([f, a]);
+      f = Math.max(f, b);
+    }
+    if (f < n) keep.push([f, n]);
+    const parts = [id3WithoutLength(bytes)];
+    let keptFrames = 0;
+    for (const [a, b] of keep) { parts.push(bytes.subarray(offsets[a], b < n ? offsets[b] : end)); keptFrames += b - a; }
+    const blob = new Blob(parts, { type: 'audio/mpeg' });
+    const removed = S.duration - (keptFrames * spf) / rate;
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = S.file.name.replace(/\.[^.]+$/, '') + ' (ads removed).mp3';
+    a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    $('skipMsg').textContent = `Saved without ${ads.length} ad segment${ads.length > 1 ? 's' : ''} (${fmtDur(removed)} removed)`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+const alertMsg = (m) => { $('skipMsg').textContent = m; };
 
 // ---------- rendering ----------
 function adSegments() {
@@ -1179,6 +1242,7 @@ document.addEventListener('dragover', (e) => e.preventDefault());
 document.addEventListener('drop', (e) => e.preventDefault());
 
 $('asrStart').onclick = runAsr;
+$('downloadClean').onclick = downloadWithoutAds;
 $('asrStop').onclick = stopAsr;
 $('zoom').onchange = drawPlot;
 $('skipSource').onchange = () => { drawAll(); };
